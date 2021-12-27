@@ -8,66 +8,152 @@ using System.Text;
 
 public class NetworkController : MonoBehaviour
 {
-    // Start is called before the first frame update
-    string serverIP = "192.168.0.102";
-    int port = 8080;
-    Socket udp;
-    IPEndPoint endPoint;
+    public static string serverIP = "127.0.0.1";
+    public static int port = 8080;
+    public static Socket udp;
+    public static IPEndPoint endPoint;
 
-    enum NetworkType { host, client, none };
-    NetworkType networkType = NetworkType.none;
+    public static List<EndPoint> clients;
     void Start()
     {
-
+        DontDestroyOnLoad(gameObject);
     }
 
     // Update is called once per frame
     void Update()
     {
-        switch (networkType)
+        if (udp == null || udp.Available == 0) { return; }
+
+        byte[] rawPacket = new byte[2048];
+        EndPoint sender = new IPEndPoint(IPAddress.Any, port);
+        int rec = udp.ReceiveFrom(rawPacket, ref sender);
+        Debug.Log(rec);
+        byte[] packet = new byte[rec];
+        for (int i = 0; i < rec; i++) { packet[i] = rawPacket[i]; }
+        Message msg = Message.FromBytes(packet);
+        
+        string type = msg.type;
+        if (type != "render_move" && type != "make_move")
         {
-            case NetworkType.host:
-                if (Time.frameCount % 60 == 0 && udp.Available != 0)
+            LogMessage(Shared.networkType.ToString(), "Got message:", type);
+        }
+        GameController gc = GameObject.FindObjectOfType<GameController>();
+        switch (Shared.networkType)
+        {
+            case Shared.NetworkType.host:
+                switch (type)
                 {
-                    byte[] packet = new byte[64];
-                    EndPoint sender = new IPEndPoint(IPAddress.Any, port);
+                    case "connect":
+                        LogMessage("Clients connected", (clients.Count + 1).ToString());
+                        if (clients.Count >= 3) { return; }
 
-                    int rec = udp.ReceiveFrom(packet, ref sender);
-                    string info = Encoding.Default.GetString(packet);
-
-                    Debug.Log("Server received: " + info);
+                        int id = clients.Count + 2;
+                        clients.Add(sender);
+                        Message msgToSend = new Message();
+                        msgToSend.type = "accept";
+                        msgToSend.data["id"] = id.ToString();
+                        SendPacket(sender, msgToSend);
+                        GameObject.Find("ConnectedAmount").GetComponent<Text>().text = "Connected: " + id + "/4";
+                        break;
+                    case "disconnect":
+                        clients.RemoveAt(msg.id - 2);
+                        GameObject.Find("ConnectedAmount").GetComponent<Text>().text = "Connected: " + (msg.id - 1) + "/4";
+                        break;
+                    case "make_move":
+                        GameController.HandleMove((Move)msg);
+                        break;
+                    case "shot_pacman":
+                        GameObject p = gc.CreatePacman((Move)msg);
+                        GameController.BroadcastPacman(p);
+                        break;
+                    case "me_hit":
+                        GameController.HandleMeHit(msg);
+                        break;
+                    case "heal":
+                        GameController.HandleBooster(msg);
+                        break;
+                    case "damage":
+                        GameController.HandleBooster(msg);
+                        break;
+                    default:
+                        Debug.Log("[" + type + "]");
+                        break;
                 }
                 break;
-            case NetworkType.client:
-                if (Time.frameCount % 60 == 0 && udp.Available != 0)
+            case Shared.NetworkType.client:
+                switch (type)
                 {
-                    SendPacket();
+                    case "accept":
+                        MenuController.IncConnectedAmount(msg);
+                        break;
+                    case "start":
+                        MenuController.StartGame();
+                        break;
+                    case "render_move":
+                        GameController.RenderMove((Move)msg);
+                        break;
+                    case "initgame":
+                        GameController.InitGame(msg);
+                        break;
+                    case "create_packman":
+                        gc.CreatePacman((Move)msg);
+                        break;
+                    case "hit":
+                        GameController.HandleHit(msg);
+                        break;
+                    case "kill":
+                        gc.HandleKill(msg);
+                        break;
+                    case "wall":
+                        gc.SpawnWall((Move)msg);
+                        break;
+                    case "heal_up":
+                        GameController.HealthUp(msg);
+                        break;
+                    case "damage_up":
+                        GameController.DamageUp(msg);
+                        break;
+                    case "spawn_heal":
+                        gc.SpawnHeal((Move)msg);
+                        break;
+                    case "spawn_damage":
+                        gc.SpawnDamage((Move)msg);
+                        break;
+                    default:
+                        LogMessage("[", type, "]");
+                        break;
                 }
                 break;
             default:
+                LogMessage("Default NetworkType");
                 break;
         }
     }
 
-    public void SendPacket()
+    static void SendPacket(EndPoint addr, string type)
     {
-        byte[] arr = Encoding.ASCII.GetBytes("Haha " + Time.frameCount);
-        udp.SendTo(arr, endPoint);
+        Message msg = new Message();
+        msg.type = type;
+        byte[] arr = msg.ToBytes();
+        udp.SendTo(arr, addr);
     }
 
-    public void HostButton()
+    static void SendPacket(EndPoint addr, Message msg)
     {
-        HideUI();
-        networkType = NetworkType.host;
+        if (msg.type != "render_move" && msg.type != "make_move") {
+            Debug.Log("Sending a message, type: " + msg.type + " id: " + msg.id);
+        }
         
-        IPAddress ip = GetLocalIPAddress();
-        IPEndPoint endPoint = new IPEndPoint(ip, port);
+        byte[] arr = msg.ToBytes();
+        udp.SendTo(arr, addr);
+    }
 
-        Debug.Log("Server IP Address: " + ip);
-        Debug.Log("Port: " + port);
-        udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        udp.Bind(endPoint);
-        udp.Blocking = false;
+    public static void BroadcastPacket(Message msg)
+    {
+        foreach (EndPoint p in clients)
+        {
+            SendPacket(p, msg);
+        }
     }
 
     public static IPAddress GetLocalIPAddress()
@@ -83,30 +169,56 @@ public class NetworkController : MonoBehaviour
         return null;
     }
 
-    public void ConnectButton()
+    public static void CreateServer()
     {
-        HideUI();
-        networkType = NetworkType.client;
+        if (udp != null)
+        {
+            Debug.Log("Server is already created!");
+        }
+        clients = new List<EndPoint>();
+        IPAddress ip = IPAddress.Parse(serverIP);
+        IPEndPoint endPoint = new IPEndPoint(ip, port);
 
-        endPoint = new IPEndPoint(IPAddress.Parse(serverIP), port);
+        udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        udp.Bind(endPoint);
+        udp.Blocking = false;
+        Debug.Log("Server has been created successfully. IP Address: " + ip + ", port: " + port);
+    }
+
+    public static void ConnectToServer()
+    {
         udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         udp.Blocking = false;
-        SendInitialReqToServer();
+
+        Message msg = new Message();
+        msg.type = "connect";
+        SendPacketToServer(msg);
+        LogMessage("Sent to server:", msg.type);
     }
 
-    void SendInitialReqToServer()
-    {
-        string p = "n " + transform.position.x + " " + transform.position.y
-                + " " + transform.position.z;
-
-        byte[] packet = Encoding.ASCII.GetBytes(p);
-        udp.SendTo(packet, endPoint);
+    public static void SendPacketToServer(Message msg) {
+        endPoint = new IPEndPoint(IPAddress.Parse(serverIP), port);
+        SendPacket(endPoint, msg);
     }
-    void HideUI()
+
+    public static void StartGame()
     {
-        foreach (Button btn in FindObjectsOfType<Button>())
-        {
-            btn.gameObject.SetActive(false);
+        Message msg = new Message();
+        msg.type = "start";
+        BroadcastPacket(msg);
+    }
+
+    public static void LogMessage(params string[] msg)
+    {
+        Text logText = GameObject.Find("LogLine").GetComponent<Text>();
+        if (logText.text.Split('\n').Length > 50) {
+            logText.text = "";
         }
+        string totalMsg = "";
+        foreach (string msgElem in msg)
+        {
+            totalMsg += msgElem + " ";
+        }
+        logText.text += '\n' + totalMsg;
     }
 }
